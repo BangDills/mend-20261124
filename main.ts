@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync, rmSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { unifiedEdits, applyUnifiedEdit, type UnifiedEdit } from './unified.ts';
+import { srEdits, applySREdit, type SREdit } from './sr.ts';
 
 async function maybeRunTrial(): Promise<boolean> {
   const envUrl = process.env.MAKEFUN_ENV_URL;
@@ -234,7 +235,7 @@ async function main(): Promise<void> {
     }
   }
 
-  if (effectiveFormat !== 'json' && effectiveFormat !== 'unified') {
+  if (effectiveFormat !== 'json' && effectiveFormat !== 'unified' && effectiveFormat !== 'search-replace') {
     out('error: parse 1');
     process.exitCode = 2;
     return;
@@ -243,6 +244,7 @@ async function main(): Promise<void> {
   // Parse JSON edits.
   let edits: Edit[] = [];
   let uedits: UnifiedEdit[] = [];
+  let sredits: SREdit[] = [];
   if (effectiveFormat === 'json') {
   {
     let firstNbIdx = -1;
@@ -323,7 +325,7 @@ async function main(): Promise<void> {
       edits = tmp;
     }
   }
-  } else {
+  } else if (effectiveFormat === 'unified') {
     const parsed = unifiedEdits(lines);
     if (!parsed.ok) {
       out(`error: parse ${parsed.line}`);
@@ -336,6 +338,19 @@ async function main(): Promise<void> {
       return;
     }
     uedits = parsed.edits;
+  } else {
+    const parsed = srEdits(lines);
+    if (!parsed.ok) {
+      out(`error: parse ${parsed.line}`);
+      process.exitCode = 2;
+      return;
+    }
+    if (parsed.edits.length === 0) {
+      out('error: parse 1');
+      process.exitCode = 2;
+      return;
+    }
+    sredits = parsed.edits;
   }
 
   // Run the unified path when the patch is a unified diff.
@@ -506,6 +521,108 @@ async function main(): Promise<void> {
     for (const l of allLines) out(l.line);
     const n = allLines.length;
     out(n === 1 ? 'ok: 1 file' : `ok: ${n} files`);
+    process.exitCode = 0;
+    return;
+  }
+
+  // Run the search-replace path when the patch holds SEARCH/REPLACE blocks.
+  if (effectiveFormat === 'search-replace') {
+    // Shared in-memory tree: regular files plus directory markers so a
+    // `create` that collides with a directory fails with `exists`.
+    const initialCache = new Map<string, string | null>();
+    const current = new Map<string, string | null>();
+    const dirSet = new Set<string>();
+    const readInitial = (p: string): string | null => {
+      if (initialCache.has(p)) return initialCache.get(p)!;
+      let v: string | null = null;
+      try {
+        if (existsSync(p)) {
+          const st = statSync(p);
+          if (st.isFile()) {
+            v = readFileSync(p, 'utf8');
+          } else {
+            initialCache.set(p, null);
+            current.set(p, null);
+            dirSet.add(p);
+            return null;
+          }
+        }
+      } catch {
+        v = null;
+      }
+      initialCache.set(p, v);
+      current.set(p, v);
+      return v;
+    };
+    const allPaths = new Set<string>();
+    for (const e of sredits) allPaths.add(e.path);
+    for (const p of allPaths) readInitial(p);
+
+    type Failure = { code: string; path: string };
+    const failures: (Failure | null)[] = [];
+    const getFile = (p: string): string | null => {
+      if (current.has(p)) return current.get(p)!;
+      return readInitial(p);
+    };
+
+    for (const e of sredits) {
+      // Directories read back as null, but a create that collides with one
+      // fails with `exists`, not by writing through it.
+      if (e.kind === 'create' && dirSet.has(e.path) && (current.get(e.path) ?? null) === null) {
+        failures.push({ code: 'exists', path: e.path });
+        continue;
+      }
+      const res = applySREdit(e, getFile, strict);
+      if (!res.ok) {
+        failures.push({ code: res.code, path: res.path });
+        continue;
+      }
+      const v = res.value;
+      if (v.kind === 'create' || v.kind === 'change') {
+        current.set(v.path, v.text);
+      }
+      // noop-change: no bytes changed.
+      failures.push(null);
+    }
+
+    const failedList: Failure[] = [];
+    for (const f of failures) if (f !== null) failedList.push(f);
+    if (failedList.length > 0) {
+      for (const f of failedList) out(`error: ${f.code} ${f.path}`);
+      out(`failed: ${failedList.length} of ${sredits.length} edits`);
+      process.exitCode = 1;
+      return;
+    }
+
+    const changed: { path: string; kind: 'A' | 'M' }[] = [];
+    const touched = new Set<string>();
+    for (const e of sredits) touched.add(e.path);
+    for (const p of touched) {
+      if (dirSet.has(p)) continue;
+      const before = initialCache.get(p) ?? null;
+      const after = current.get(p) ?? null;
+      if (before === after) continue;
+      if (before === null && after !== null) changed.push({ path: p, kind: 'A' });
+      else if (before !== null && after !== null && before !== after) changed.push({ path: p, kind: 'M' });
+    }
+    changed.sort((a, b) => Buffer.compare(Buffer.from(a.path, 'utf8'), Buffer.from(b.path, 'utf8')));
+
+    if (!check) {
+      for (const p of touched) {
+        if (dirSet.has(p)) continue;
+        const before = initialCache.get(p) ?? null;
+        const after = current.get(p) ?? null;
+        if (before === after) continue;
+        if (after !== null) {
+          const d = dirname(p);
+          if (d !== '.' && d !== '') mkdirSync(d, { recursive: true });
+          writeFileSync(p, after, 'utf8');
+        }
+      }
+    }
+
+    for (const c of changed) out(`${c.kind} ${c.path}`);
+    out(changed.length === 1 ? 'ok: 1 file' : `ok: ${changed.length} files`);
     process.exitCode = 0;
     return;
   }
